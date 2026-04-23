@@ -316,9 +316,11 @@ class TrackerGUI:
         row = self._sec(row, '  3D TRACKING  (VortexLegendre)')
 
         self.enable_3d_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(self.main, text='Enable 3D Tracking (find Z by refocusing)',
-                        variable=self.enable_3d_var,
-                        command=self._toggle_3d).grid(
+        self.enable_3d_cb = ttk.Checkbutton(
+            self.main, text='Enable 3D Tracking (find Z by refocusing)',
+            variable=self.enable_3d_var,
+            command=self._toggle_3d)
+        self.enable_3d_cb.grid(
             row=row, column=0, columnspan=2, sticky='w', padx=20, pady=2); row+=1
 
         self._3d_frame = ttk.Frame(self.main)
@@ -516,6 +518,13 @@ class TrackerGUI:
         self.filter_circ_var.set(d['filter_by_circularity'])
         self._toggle_dog(); self._toggle_color_filter(); self._toggle_circ_filter()
 
+        # 3D tracking is only available for Hologram mode
+        is_hologram = self.mode_var.get() == 'Hologram'
+        if not is_hologram:
+            self.enable_3d_var.set(False)   # force off
+            self._toggle_3d()               # disable inner controls
+        self.enable_3d_cb.configure(state='normal' if is_hologram else 'disabled')
+
     def _get_fps(self, video_path):
         """Return FPS from video, or override value if enabled."""
         if self.fps_override_var.get():
@@ -704,16 +713,13 @@ class TrackerGUI:
                                      p['z_max'] + p['z_step'] / 2,
                                      p['z_step'])
 
-                def _reconstruct(gray):
+                def _extract_obj_field(gray):
                     """
-                    Full VortexLegendre pipeline:
-                    1. Crop to square
-                    2. spatial_filter  → holo_filtered
-                    3. vortex_compensation → fx_max, fy_max
-                    4. reference_wave + multiply → obj_complex
-                    5. legendre_compensation → phase_corrected
-                    6. Wavefront reconstruction (orders 1-9)
-                    7. Final compensation → compensated complex field
+                    Steps 1-4: Crop → Spatial filter → Vortex → Reference wave.
+                    Returns the complex object field WITHOUT Legendre compensation,
+                    ready for ASM propagation and focus search.
+                    Legendre is applied AFTER finding the focal plane (correct order
+                    per literature: propagate first, compensate at focal plane).
                     """
                     sample = gray.astype(np.float64)
                     H_s, W_s = sample.shape
@@ -727,30 +733,35 @@ class TrackerGUI:
                     m_g, n_g = np.meshgrid(np.arange(-M//2, M//2),
                                            np.arange(-N//2, N//2))
 
-                    # 1-2. Spatial filtering
+                    # 1-2. Spatial filtering (isolate +1 diffraction order)
                     _, holo_filt, fxm, fym, _ = VL.spatial_filter(
                         sample, M, N, save='No', factor=factor, rotate=False)
 
-                    # 3. Vortex compensation
+                    # 3. Vortex compensation (sub-pixel carrier frequency refinement)
                     logamp = 10 * np.log10(
                         np.abs(fftshift(fft2(fftshift(holo_filt))) + 1e-6)**2)
                     fieldH = _mf(logamp, size=(1, 1), mode='reflect')
                     fxm, fym = VL.vortex_compensation(fieldH, fxm, fym)[0]
 
-                    # 4. Reference wave → complex object field
+                    # 4. Reference wave → complex object field (carrier tilt removed)
                     refwa       = VL.reference_wave(fxm, fym, m_g, n_g,
                                                     lambda_, dxy, k_wave,
                                                     fx_0, fy_0, M, N, dy=dxy)
-                    obj_complex = refwa * holo_filt
+                    return refwa * holo_filt
 
-                    # 5. Legendre compensation
+                def _apply_legendre(field):
+                    """
+                    Steps 5-7: Legendre polynomial compensation applied to a complex
+                    field that has already been propagated to the focal plane.
+                    Removes residual low-order aberrations (defocus, astigmatism,
+                    coma, and higher-order terms) at the correct propagation distance.
+                    """
+                    N = field.shape[0]
                     limit = N / 2
                     _, legendre_coeffs = VL.legendre_compensation(
-                        obj_complex, limit,
-                        RemovePiston=True, UsePCA=True)
+                        field, limit, RemovePiston=True, UsePCA=True)
 
-                    # 6. Wavefront reconstruction (orders 1-9)
-                    gridSize = obj_complex.shape[0]
+                    gridSize = field.shape[0]
                     coords   = np.linspace(-1, 1 - 2/gridSize, gridSize)
                     X_g, Y_g = np.meshgrid(coords, coords)
                     dA       = (2 / gridSize)**2
@@ -770,37 +781,35 @@ class TrackerGUI:
                         coeffs[np.newaxis, :] * Legendres[:, :len(order)], axis=1
                     ).reshape(ny, nx)
 
-                    # 7. Final phase compensation
-                    compensated = (np.abs(obj_complex) *
-                                   (np.exp(1j * np.angle(obj_complex)) /
-                                    np.exp(1j * wavefront)))
-                    return compensated
+                    return (np.abs(field) *
+                            (np.exp(1j * np.angle(field)) / np.exp(1j * wavefront)))
 
                 def _asm_batch(field):
+                    """Propagate complex field to all z_planes. Returns list of fields."""
                     N, M = field.shape
                     FX, FY = np.meshgrid(np.fft.fftfreq(M, d=dxy),
                                          np.fft.fftfreq(N, d=dxy))
                     sq = np.sqrt(np.clip(1 - (lambda_*FX)**2 - (lambda_*FY)**2, 0, None))
                     F  = fftshift(fft2(ifftshift(field)))
-                    results = []
-                    for z in z_planes:
-                        H = np.exp(1j * k_wave * z * sq)
-                        results.append(fftshift(ifft2(ifftshift(F * H))))
-                    return results
+                    return [fftshift(ifft2(ifftshift(F * np.exp(1j * k_wave * z * sq))))
+                            for z in z_planes]
 
-                def _find_z(field, detections, frame_shape):
+                def _find_z(obj_field, detections, frame_shape):
                     """
-                    Find optimal Z by evaluating the focus metric ONLY on crops
-                    around each 2D-detected particle.
-                    Adjusts coordinates to the reconstructed field space (square crop).
+                    Correct pipeline order (per literature):
+                      1. Propagate obj_field (WITHOUT Legendre) to every Z plane via ASM.
+                      2. Evaluate focus metric on each plane → find best_z.
+                      3. Return best_z and the propagated field at best_z.
+                    Legendre compensation is applied OUTSIDE on the best_z field.
+                    Evaluates only on crops around detected particles for speed.
                     """
-                    propagated = _asm_batch(field)
-                    best_z, best_s = z_planes[0], -np.inf
+                    propagated = _asm_batch(obj_field)
+                    best_z, best_s, best_field = z_planes[0], -np.inf, propagated[0]
 
-                    fh, fw   = frame_shape[:2]
-                    N, M     = field.shape
-                    x_off    = (fw - M) // 2
-                    y_off    = (fh - N) // 2
+                    fh, fw = frame_shape[:2]
+                    N, M   = obj_field.shape
+                    x_off  = (fw - M) // 2
+                    y_off  = (fh - N) // 2
 
                     if len(detections) > 0:
                         crop = 48
@@ -808,7 +817,6 @@ class TrackerGUI:
                             score   = 0.0
                             n_valid = 0
                             for pt in detections:
-                                # Convertir coordenadas del frame al espacio reconstruido
                                 cx = int(pt[0]) - x_off
                                 cy = int(pt[1]) - y_off
                                 x0 = int(np.clip(cx - crop, 0, M))
@@ -823,14 +831,14 @@ class TrackerGUI:
                             if n_valid > 0:
                                 score /= n_valid
                             if score > best_s:
-                                best_s, best_z = score, z
+                                best_s, best_z, best_field = score, z, prop
                     else:
                         for z, prop in zip(z_planes, propagated):
                             s = compute_focus_metric(prop, p['z_domain'], p['z_metric'])
                             if s > best_s:
-                                best_s, best_z = s, z
+                                best_s, best_z, best_field = s, z, prop
 
-                    return best_z
+                    return best_z, best_field
 
             cap   = cv2.VideoCapture(p['video_path'])
             total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -902,7 +910,9 @@ class TrackerGUI:
             # ── Compute Z for frame 0 (if 3D) ──────────────────────────────────
             if p['enable_3d']:
                 try:
-                    z0 = _find_z(_reconstruct(first_gray))
+                    obj0 = _extract_obj_field(first_gray)
+                    z0, field0 = _find_z(obj0, p0, first_gray.shape)
+                    recon_field_f0 = _apply_legendre(field0)
                     for i in range(len(kfs)):
                         z_tracks[i][0] = z0
                 except Exception as ez:
@@ -950,9 +960,10 @@ class TrackerGUI:
                 recon_field = None
                 if p['enable_3d']:
                     try:
-                        recon_field      = _reconstruct(gray)
+                        obj_field        = _extract_obj_field(gray)
+                        z_cur, focal_field = _find_z(obj_field, p1, gray.shape)
+                        recon_field      = _apply_legendre(focal_field)
                         last_recon_field = recon_field
-                        z_cur            = _find_z(recon_field, p1, gray.shape)
                     except Exception as ez:
                         print(f'[3D] Frame {fi}: {ez}')
                         recon_field = last_recon_field   # fall back to last valid field
@@ -1007,7 +1018,7 @@ class TrackerGUI:
                                              cv2.NORM_MINMAX).astype(np.uint8)
                     disp = cv2.cvtColor(disp_img, cv2.COLOR_GRAY2BGR)
 
-                    # Square-crop offset in X (same calculation as _reconstruct)
+                    # Square-crop offset in X (same crop as _extract_obj_field)
                     fh, fw = frame.shape[:2]
                     rh, rw = disp.shape[:2]
                     x_off = (fw - rw) // 2   # pixels cropped on the left
