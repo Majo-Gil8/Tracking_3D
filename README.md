@@ -9,8 +9,8 @@ Kalman-filter-based 3D particle tracker for off-axis Digital Holographic Microsc
 ## Repository structure
  
 ```
-├── tracker_gui_7.py                # Graphical user interface (2D + 3D)
-├── function_tracking_improved.py   # Core 2D tracking library
+├── tracker_gui.py                # Graphical user interface (2D + 3D)
+├── function_tracking_3D.py   # Core 2D tracking library
 ├── vortexLegendre.py               # Spatial filter, Vortex, Legendre compensation
 ├── focus_metrics.py                # Focus metrics for Z search
 ├── Videos                          # Examples videos with the tracking/reconstructions parameters
@@ -126,7 +126,7 @@ Fits the unwrapped phase of the propagated field **at the focal plane** with a 2
 - **`RemovePiston=True`** (default) — zeroes the piston coefficient (order 1) before subtracting the wavefront, which removes the global DC offset.
 - **`RemovePiston=False`** — searches for the optimal piston value that minimises the phase variance of the compensated field.
 - **`UsePCA=True`** — extracts the dominant wavefront component via SVD before fitting, which improves robustness when the field contains multiple superimposed contributions.
-### Angular Spectrum propagation (`vortexLegendre.py` / `tracker_gui_7.py`)
+### Angular Spectrum propagation (`vortexLegendre.py` / `tracker_gui.py`)
  
 Propagates the compensated complex field to each plane in the Z search range using the exact transfer function:
  
